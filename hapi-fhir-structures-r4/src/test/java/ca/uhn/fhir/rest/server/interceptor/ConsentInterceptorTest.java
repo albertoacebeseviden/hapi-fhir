@@ -34,6 +34,7 @@ import org.apache.http.client.methods.HttpGet;
 import org.hl7.fhir.instance.model.api.IBaseParameters;
 import org.hl7.fhir.instance.model.api.IBaseResource;
 import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.Composition;
 import org.hl7.fhir.r4.model.Identifier;
 import org.hl7.fhir.r4.model.OperationOutcome;
 import org.hl7.fhir.r4.model.Parameters;
@@ -62,6 +63,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.timeout;
@@ -79,11 +81,14 @@ public class ConsentInterceptorTest {
 	private int myPort;
 	private static final DummyPatientResourceProvider ourPatientProvider = new DummyPatientResourceProvider(ourCtx);
 	private static final DummySystemProvider ourSystemProvider = new DummySystemProvider();
+	private static final HashMapResourceProvider<Bundle> ourBundleProvider =
+		 new HashMapResourceProvider<>(ourCtx, Bundle.class);
 
 	@RegisterExtension
 	static final RestfulServerExtension ourServer = new RestfulServerExtension(ourCtx)
 		.registerProvider(ourPatientProvider)
 		.registerProvider(ourSystemProvider)
+		.registerProvider(ourBundleProvider)
 		.withPagingProvider(new FifoMemoryPagingProvider(10));
 
 	@Mock(answer = Answers.CALLS_REAL_METHODS)
@@ -109,6 +114,7 @@ public class ConsentInterceptorTest {
 
 		ourServer.registerInterceptor(myInterceptor);
 		ourPatientProvider.clear();
+		ourBundleProvider.clear();
 	}
 
 	@Test
@@ -493,6 +499,119 @@ public class ConsentInterceptorTest {
 		verify(myConsentSvc, timeout(2000).times(0)).completeOperationFailure(any(), any(), any());
 		verifyNoMoreInteractions(myConsentSvc);
 	}
+
+
+	private Bundle createDocumentBundle() {
+		Bundle bundle = new Bundle();
+		bundle.setType(Bundle.BundleType.DOCUMENT);
+		bundle.setId("test-bundle-id");
+		Composition composition = new Composition();
+		composition.setId("composition-in-bundle");
+
+		Patient patient = new Patient();
+		patient.setId("patient-in-bundle");
+
+		bundle.addEntry().setResource(composition);
+		bundle.addEntry().setResource(patient);
+		return bundle;
+	}
+	@Test
+	void testGetBundle_WhenCanSeeReturnsRejectForBundle_WillSeeIsNotCalled() throws IOException {
+		ourBundleProvider.store(createDocumentBundle());
+		when(myConsentSvc.canSeeResource(any(),any(),any())).thenReturn(ConsentOutcome.REJECT);
+
+		HttpGet httpGet = new HttpGet("http://localhost:" + myPort + "/Bundle/test-bundle-id");
+		try (CloseableHttpResponse status = myClient.execute(httpGet)) {
+			assertEquals(404, status.getStatusLine().getStatusCode());
+		}
+
+		verify(myConsentSvc, timeout(2000).times(1)).canSeeResource(any(), any(), any());
+		// willSee should not be called
+		verify(myConsentSvc, timeout(2000).times(0)).willSeeResource(any(), any(), any());
+	}
+
+	@Test
+	void testGetPatient_WhenWillSeeReturnsRejectForBundle_WillSeeIsNotCalledForChildren() throws IOException {
+		Patient p = new Patient();
+		p.setId("ppid");
+		ourPatientProvider.store(p);
+		when(myConsentSvc.canSeeResource(any(),any(),any())).thenReturn(ConsentOutcome.PROCEED);
+		when(myConsentSvc.willSeeResource(any(),isA(Patient.class),any())).thenReturn(ConsentOutcome.REJECT);
+
+		HttpGet httpGet = new HttpGet("http://localhost:" + myPort + "/Patient/ppid");
+		try (CloseableHttpResponse status = myClient.execute(httpGet)) {
+			String responseContent = IOUtils.toString(status.getEntity().getContent(), Charsets.UTF_8);
+			System.out.println(responseContent);
+			assertEquals(404, status.getStatusLine().getStatusCode());
+		}
+
+		verify(myConsentSvc, timeout(2000).times(1)).canSeeResource(any(), any(), any());
+		// will see should be called only once, for the bundle
+		verify(myConsentSvc, timeout(2000).times(1)).willSeeResource(any(), any(), any());
+	}
+	@Test
+	void testGetBundle_WhenWillSeeReturnsRejectForBundle_WillSeeIsNotCalledForChildren() throws IOException {
+		ourBundleProvider.store(createDocumentBundle());
+		when(myConsentSvc.canSeeResource(any(),any(),any())).thenReturn(ConsentOutcome.PROCEED);
+		when(myConsentSvc.willSeeResource(any(),isA(Bundle.class),any())).thenReturn(ConsentOutcome.REJECT);
+
+		HttpGet httpGet = new HttpGet("http://localhost:" + myPort + "/Bundle/test-bundle-id");
+		try (CloseableHttpResponse status = myClient.execute(httpGet)) {
+			String responseContent = IOUtils.toString(status.getEntity().getContent(), Charsets.UTF_8);
+			System.out.println(responseContent);
+			assertEquals(404, status.getStatusLine().getStatusCode());
+		}
+
+		verify(myConsentSvc, timeout(2000).times(1)).canSeeResource(any(), any(), any());
+		// will see should be called only once, for the bundle
+		verify(myConsentSvc, timeout(2000).times(1)).willSeeResource(any(), any(), any());
+	}
+	@Test
+	void testGetBundle_WhenWillSeeReturnsAuthorizedForBundle_WillSeeIsNotCalledForChildResources() throws IOException {
+		ourBundleProvider.store(createDocumentBundle());
+		when(myConsentSvc.canSeeResource(any(),any(),any())).thenReturn(ConsentOutcome.PROCEED);
+		// we expect willSeeResource to be called only once, and that call should be  for the bundle,
+		// no need to stub the calls for the child resources
+		when(myConsentSvc.willSeeResource(any(),isA(Bundle.class),any())).thenReturn(ConsentOutcome.AUTHORIZED);
+
+		HttpGet httpGet = new HttpGet("http://localhost:" + myPort + "/Bundle/test-bundle-id");
+		try (CloseableHttpResponse status = myClient.execute(httpGet)) {
+			assertEquals(200, status.getStatusLine().getStatusCode());
+		}
+
+		verify(myConsentSvc, timeout(2000).times(1)).startOperation(any(), any());
+		verify(myConsentSvc, timeout(2000).times(1)).shouldProcessCanSeeResource(any(), any());
+		verify(myConsentSvc, timeout(2000).times(1)).canSeeResource(any(), any(), any());
+		// willSee should only be called once, for the bundle
+		verify(myConsentSvc, timeout(2000).times(1)).willSeeResource(any(), any(), any());
+		verify(myConsentSvc, timeout(2000).times(1)).completeOperationSuccess(any(), any());
+		verify(myConsentSvc, timeout(2000).times(0)).completeOperationFailure(any(), any(), any());
+	}
+
+	@Test
+	void testGetBundle_WhenWillSeeReturnsProceedForBundle_WillSeeIsCalledForChildResources() throws IOException {
+		ourBundleProvider.store(createDocumentBundle());
+
+		when(myConsentSvc.canSeeResource(any(),any(),any())).thenReturn(ConsentOutcome.PROCEED);
+		when(myConsentSvc.willSeeResource(any(),isA(Bundle.class),any())).thenReturn(ConsentOutcome.PROCEED);
+		// the test bundle contains a Composition and a Patient, we expect calls to them in this case
+		when(myConsentSvc.willSeeResource(any(),isA(Composition.class),any())).thenReturn(ConsentOutcome.PROCEED);
+		when(myConsentSvc.willSeeResource(any(),isA(Patient.class),any())).thenReturn(ConsentOutcome.PROCEED);
+
+		HttpGet httpGet = new HttpGet("http://localhost:" + myPort + "/Bundle/test-bundle-id");
+		try (CloseableHttpResponse status = myClient.execute(httpGet)) {
+			assertEquals(200, status.getStatusLine().getStatusCode());
+		}
+
+		verify(myConsentSvc, timeout(2000).times(1)).startOperation(any(), any());
+		verify(myConsentSvc, timeout(2000).times(1)).shouldProcessCanSeeResource(any(), any());
+		verify(myConsentSvc, timeout(2000).times(1)).canSeeResource(any(), any(), any());
+		// expect willSee to be called 3 times
+		verify(myConsentSvc, timeout(2000).times(3)).willSeeResource(any(), any(), any());
+		verify(myConsentSvc, timeout(2000).times(1)).completeOperationSuccess(any(), any());
+		verify(myConsentSvc, timeout(2000).times(0)).completeOperationFailure(any(), any(), any());
+	}
+
 
 	@Test
 	public void testPage_SeeResourceReplacesInnerResource() throws IOException {
